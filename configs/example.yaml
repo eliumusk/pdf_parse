@@ -1,0 +1,15 @@
+parser: mineru # options: pymupdf | markitdown | mineru (later)
+input_dir: "test/"
+output_path: "docs/docs.parquet"
+num_workers: 8
+allow_network: false
+
+cleaning:
+  unicode_nfkc: true
+  fix_hyphenation: true
+  remove_headers_footers: true
+
+dedup:
+  enabled: false
+  fuzzy_threshold: 90
+
