@@ -142,17 +142,103 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
             if err:
                 errors.append(err)
 
-    # Dedup pipeline (implemented but default disabled) — version-level dedup is OFF per requirement
+    # Write all outputs first (never delete parsed results)
+    write_parquet(results, cfg.output_path, one_file_per_doc=cfg.one_file_per_doc)
+
+    # Dedup pipeline: Create index marking duplicates (don't delete files)
     if cfg.dedup.enabled and results:
         try:
             from rapidfuzz import fuzz
-        except Exception:
-            # If rapidfuzz missing, skip fuzzy dedup
-            pass
-        # We keep it turned off by default as agreed.
 
-    # Write outputs
-    write_parquet(results, cfg.output_path)
+            print(f"\n🔍 Creating dedup index for {len(results)} documents...")
+
+            # Mark duplicates but keep all records
+            for rec in results:
+                rec["is_duplicate"] = False
+                rec["duplicate_of"] = None
+
+            # Group by arxiv_id (mark older versions as duplicates)
+            arxiv_groups = {}
+            for i, rec in enumerate(results):
+                arxiv_id = rec.get("arxiv_id")
+                if arxiv_id:
+                    arxiv_version = rec.get("arxiv_version", "v1")
+                    if arxiv_id not in arxiv_groups:
+                        arxiv_groups[arxiv_id] = (i, arxiv_version)
+                    else:
+                        existing_idx, existing_version = arxiv_groups[arxiv_id]
+                        if arxiv_version > existing_version:
+                            # Mark old version as duplicate
+                            results[existing_idx]["is_duplicate"] = True
+                            results[existing_idx]["duplicate_of"] = rec.get("doc_id")
+                            arxiv_groups[arxiv_id] = (i, arxiv_version)
+                        else:
+                            # Mark current as duplicate
+                            rec["is_duplicate"] = True
+                            rec["duplicate_of"] = results[existing_idx].get("doc_id")
+
+            # Fuzzy dedup by title (mark similar titles as duplicates)
+            if cfg.dedup.fuzzy_threshold > 0:
+                for i, rec in enumerate(results):
+                    if rec["is_duplicate"]:
+                        continue  # Already marked
+
+                    title = rec.get("title", "")
+                    if not title:
+                        continue
+
+                    # Check similarity with previous non-duplicate titles
+                    for j in range(i):
+                        if results[j]["is_duplicate"]:
+                            continue
+
+                        other_title = results[j].get("title", "")
+                        if not other_title:
+                            continue
+
+                        similarity = fuzz.token_set_ratio(title.lower(), other_title.lower())
+                        if similarity >= cfg.dedup.fuzzy_threshold:
+                            rec["is_duplicate"] = True
+                            rec["duplicate_of"] = results[j].get("doc_id")
+                            break
+
+            # Count duplicates
+            duplicate_count = sum(1 for rec in results if rec["is_duplicate"])
+            unique_count = len(results) - duplicate_count
+
+            print(f"✅ Marked {duplicate_count} duplicates, {unique_count} unique documents")
+
+            # Write dedup index
+            import pandas as pd
+            from pathlib import Path
+
+            index_data = []
+            for rec in results:
+                index_data.append({
+                    "doc_id": rec.get("doc_id"),
+                    "title": rec.get("title"),
+                    "arxiv_id": rec.get("arxiv_id"),
+                    "arxiv_version": rec.get("arxiv_version"),
+                    "is_duplicate": rec["is_duplicate"],
+                    "duplicate_of": rec["duplicate_of"],
+                    "source_path": rec.get("source_path"),
+                })
+
+            index_df = pd.DataFrame(index_data)
+
+            # Save index to same directory as output
+            if cfg.one_file_per_doc:
+                index_path = Path(cfg.output_path) / "dedup_index.parquet"
+            else:
+                index_path = Path(cfg.output_path).parent / "dedup_index.parquet"
+
+            index_df.to_parquet(index_path, engine="pyarrow", compression="zstd", index=False)
+            print(f"📋 Dedup index saved to: {index_path}")
+
+        except Exception as e:
+            print(f"⚠️  Dedup failed: {e}, skipping deduplication")
+            import traceback
+            traceback.print_exc()
 
     # Write logs
     try:

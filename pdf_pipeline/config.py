@@ -19,13 +19,14 @@ class DedupConfig:
 
 @dataclass
 class PipelineConfig:
-    parser: str = "pymupdf"  # one of: pymupdf | markitdown | mineru
+    parser: str = "pymupdf"  # one of: pymupdf | markitdown | mineru | mineru_vlm
     input_dir: str = "test/"
     output_path: str = "docs/docs.parquet"
     num_workers: Optional[int] = None  # None -> auto
 
     # Behavior
     allow_network: bool = False  # default: offline
+    one_file_per_doc: bool = False  # If True, save each document as separate parquet file
 
     # Modules
     cleaning: CleaningConfig = field(default_factory=CleaningConfig)
@@ -44,7 +45,7 @@ def load_config(path: str) -> PipelineConfig:
 
     cfg = PipelineConfig()
     # Top-level simple fields
-    for k in ["parser", "input_dir", "output_path", "num_workers", "allow_network"]:
+    for k in ["parser", "input_dir", "output_path", "num_workers", "allow_network", "one_file_per_doc"]:
         if k in data:
             setattr(cfg, k, data[k])
 

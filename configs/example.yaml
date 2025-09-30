@@ -1,8 +1,9 @@
-parser: pymupdf # options: pymupdf | markitdown | mineru (later)
+parser: pymupdf # options: pymupdf | markitdown | mineru | mineru_vlm
 input_dir: "test/"
-output_path: "docs/docs.parquet"
+output_path: "docs/pymupdf/"  # Directory for individual files
 num_workers: 8
 allow_network: false
+one_file_per_doc: true  # Save each document separately
 
 cleaning:
   unicode_nfkc: true
@@ -10,6 +11,6 @@ cleaning:
   remove_headers_footers: true
 
 dedup:
-  enabled: false
+  enabled: true  # Create dedup index (all files are kept)
   fuzzy_threshold: 90
 
