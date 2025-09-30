@@ -1,0 +1,21 @@
+# MinerU VLM Mode Configuration
+# This config uses MinerU2.5 Vision-Language Model (1.2B parameters)
+#
+# ⚠️  GPU is HIGHLY RECOMMENDED (but can run on CPU slowly)
+# 📦 Requirements: pip install 'mineru-vl-utils[transformers]' modelscope
+
+parser: mineru_vlm
+input_dir: "test/"
+output_path: "docs/docs_mineru_vlm.parquet"
+num_workers: 1  # VLM mode should use 1 worker to avoid GPU memory issues
+allow_network: true  # May need to download model on first run
+
+cleaning:
+  unicode_nfkc: true
+  fix_hyphenation: true
+  remove_headers_footers: false  # VLM handles layout better
+
+dedup:
+  enabled: false
+  fuzzy_threshold: 90
+

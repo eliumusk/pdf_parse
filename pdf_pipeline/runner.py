@@ -8,7 +8,7 @@ from datetime import datetime
 
 from .config import PipelineConfig
 from .metadata import parse_arxiv_from_filename
-from .parsers import PyMuPDFParser, MarkItDownParser, MinerUParser, Parser, ParsedDoc
+from .parsers import PyMuPDFParser, MarkItDownParser, MinerUParser, MinerUVLMParser, Parser, ParsedDoc
 from .cleaning import apply_cleaning, remove_headers_footers_by_repetition, sanitize_utf8
 from .writer import write_parquet
 
@@ -23,6 +23,8 @@ def _make_parser(name: str) -> Parser:
         return MarkItDownParser()
     if name == "mineru":
         return MinerUParser()
+    if name == "mineru_vlm":
+        return MinerUVLMParser()
     raise ValueError(f"Unknown parser: {name}")
 
 
