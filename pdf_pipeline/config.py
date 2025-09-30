@@ -28,6 +28,9 @@ class PipelineConfig:
     allow_network: bool = False  # default: offline
     one_file_per_doc: bool = False  # If True, save each document as separate parquet file
 
+    # Parser-specific configuration (passed through to parser __init__)
+    parser_config: Dict[str, Any] = field(default_factory=dict)
+
     # Modules
     cleaning: CleaningConfig = field(default_factory=CleaningConfig)
     dedup: DedupConfig = field(default_factory=DedupConfig)
@@ -54,6 +57,8 @@ def load_config(path: str) -> PipelineConfig:
         cfg.cleaning = _merge(CleaningConfig(), data["cleaning"])  # type: ignore
     if isinstance(data.get("dedup"), dict):
         cfg.dedup = _merge(DedupConfig(), data["dedup"])  # type: ignore
+    if isinstance(data.get("parser_config"), dict):
+        cfg.parser_config = data["parser_config"]
 
     return cfg
 

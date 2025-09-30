@@ -6,9 +6,20 @@
 parser: mineru_vlm
 input_dir: "test/"
 output_path: "docs/mineru_vlm/"  # Directory for individual parquet files
-num_workers: 1  # VLM mode: use 1 worker to avoid GPU memory issues
+num_workers: 4  # VLM mode: use 1 worker to avoid GPU memory issues
 allow_network: true  # May need to download model on first run
 one_file_per_doc: true  # Save each document separately
+
+# VLM parser config
+parser_config:
+  backend: "http"  # or "transformers" / "vllm-engine"
+  # Round-robin across multiple HTTP endpoints if provided
+  api_urls:
+    - "http://172.26.104.1:30100"
+    - "http://172.26.104.1:30101"
+    - "http://172.26.104.1:30102"
+  dpi: 200
+
 
 cleaning:
   unicode_nfkc: false  # VLM output is already clean, no cleaning needed

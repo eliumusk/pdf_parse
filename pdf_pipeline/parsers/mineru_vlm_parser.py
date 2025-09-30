@@ -128,7 +128,8 @@ class MinerUVLMParser(Parser):
         model_name: str = "OpenDataLab/MinerU2.5-2509-1.2B",
         device: str = "auto",
         dpi: int = 200,
-        api_url: str = None,  # HTTP API URL for remote mode
+        api_url: str | None = None,  # Single HTTP API URL
+        api_urls: List[str] | None = None,  # Multiple HTTP API URLs for round-robin
         vllm_engine_path: str = None,  # Path to pre-loaded vLLM engine pickle file
         gpu_memory_utilization: float = 0.5,  # GPU memory utilization for vLLM
         tensor_parallel_size: int = 1,  # Number of GPUs for tensor parallelism
@@ -137,7 +138,12 @@ class MinerUVLMParser(Parser):
         self.model_name = model_name
         self.device = device
         self.dpi = dpi
-        self.api_url = api_url or os.getenv("MINERU_API_URL", "http://127.0.0.1:30100")
+        # Support multiple endpoints; fallback to single api_url or env
+        if api_urls and len(api_urls) > 0:
+            self.api_urls = api_urls
+        else:
+            self.api_urls = [api_url or os.getenv("MINERU_API_URL", "http://127.0.0.1:30100")]
+        self._rr_idx = 0
         self.vllm_engine_path = vllm_engine_path
         self.gpu_memory_utilization = gpu_memory_utilization
         self.tensor_parallel_size = tensor_parallel_size
@@ -210,41 +216,90 @@ class MinerUVLMParser(Parser):
                 f"Choose from: http, transformers, vllm-engine, vllm-async-engine"
             )
 
-    def _extract_via_http(self, image: Image.Image) -> str:
+    def _extract_via_http(self, image: Image.Image) -> List[dict]:
         """
-        Extract content from image via HTTP API
+        Extract structured blocks from image via HTTP API
 
         Args:
             image: PIL Image object
 
         Returns:
-            Extracted content as string
+            List[dict]: structured blocks as returned by server; fallback to a single text block
         """
-        # Convert image to base64
+        # Convert image to base64 (PNG to preserve quality)
         buffered = io.BytesIO()
         image.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
         # Call HTTP API
         try:
+            # Round-robin select API endpoint
+            api_url = self.api_urls[self._rr_idx % len(self.api_urls)]
+            self._rr_idx += 1
+
             response = requests.post(
-                f"{self.api_url}/v1/extract",
+                f"{api_url}/v1/extract",
                 json={"image_base64": img_base64},
-                timeout=60  # 60 seconds timeout
+                timeout=120  # allow more time for large pages
             )
             response.raise_for_status()
 
             result = response.json()
             if result.get("success"):
-                return result.get("content", "")
+                blocks = result.get("blocks")
+                if isinstance(blocks, list):
+                    return blocks
+                # Fallback: wrap plain content as a text block
+                content = result.get("content", "")
+                return [{"type": "text", "content": content}]
             else:
                 error_msg = result.get("error", "Unknown error")
                 raise RuntimeError(f"API returned error: {error_msg}")
-
         except requests.exceptions.RequestException as e:
             raise RuntimeError(
-                f"Failed to call MinerU API at {self.api_url}: {e}\n"
+                f"Failed to call MinerU API at {api_url}: {e}\n"
                 f"Make sure the H200 API service is running and accessible."
+            )
+
+    def _extract_batch_via_http(self, images: List[Image.Image]) -> List[List[dict]]:
+        """
+        Batch extract structured blocks for multiple images via HTTP API.
+        Returns a list of blocks per page in order.
+        """
+        # Encode images to base64 PNGs
+        payload_images: List[str] = []
+        for img in images:
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            payload_images.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+
+        try:
+            api_url = self.api_urls[self._rr_idx % len(self.api_urls)]
+            self._rr_idx += 1
+
+            resp = requests.post(
+                f"{api_url}/v1/extract_batch",
+                json={"images": payload_images},
+                timeout=300,  # allow longer for batches
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            blocks_per_page: List[List[dict]] = []
+            for item in results:
+                if item.get("success"):
+                    blocks = item.get("blocks")
+                    if isinstance(blocks, list):
+                        blocks_per_page.append(blocks)
+                    else:
+                        content = item.get("content", "")
+                        blocks_per_page.append([{ "type": "text", "content": content }])
+                else:
+                    blocks_per_page.append([{ "type": "text", "content": "" }])
+            return blocks_per_page
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(
+                f"Failed to call MinerU batch API: {e}"
             )
 
     def parse(self, pdf_path: str) -> ParsedDoc:
@@ -270,34 +325,36 @@ class MinerUVLMParser(Parser):
 
         # Step 2: Extract content from each page using VLM
         if self.backend == "http":
-            print(f"🤖 Extracting content using MinerU2.5 VLM (via HTTP API: {self.api_url})...")
+            print("🤖 Extracting content using MinerU2.5 VLM (via HTTP API, round-robin across endpoints)...")
         else:
-            print(f"🤖 Extracting content using MinerU2.5 VLM (local mode)...")
+            print("🤖 Extracting content using MinerU2.5 VLM (local mode)...")
 
         all_page_contents = []
 
-        for page_num, image in enumerate(images, start=1):
-            print(f"   Processing page {page_num}/{page_count}...", end=" ")
-
+        if self.backend == "http":
+            # Prefer batch mode to reduce HTTP overhead
             try:
-                # Use HTTP API or local client
-                if self.backend == "http":
-                    # Remote mode: call HTTP API
-                    content = self._extract_via_http(image)
-                    page_md = f"\n\n<!-- Page {page_num} -->\n\n{content}"
-                else:
-                    # Local mode: use two_step_extract
-                    extracted_blocks = self._client.two_step_extract(image)
-                    # Convert extracted blocks to markdown
-                    page_md = self._blocks_to_markdown(extracted_blocks, page_num)
-
-                all_page_contents.append(page_md)
-                print("✅")
-
+                blocks_pages = self._extract_batch_via_http(images)
+                for page_num, blocks in enumerate(blocks_pages, start=1):
+                    page_md = self._blocks_to_markdown(blocks, page_num)
+                    all_page_contents.append(page_md)
             except Exception as e:
-                print(f"⚠️  Error: {e}")
-                # Add placeholder for failed page
-                all_page_contents.append(f"\n\n<!-- Page {page_num}: Extraction failed -->\n\n")
+                # Fallback to per-page requests
+                for page_num, image in enumerate(images, start=1):
+                    try:
+                        blocks = self._extract_via_http(image)
+                        page_md = self._blocks_to_markdown(blocks, page_num)
+                        all_page_contents.append(page_md)
+                    except Exception as ee:
+                        all_page_contents.append(f"\n\n<!-- Page {page_num}: Extraction failed: {ee} -->\n\n")
+        else:
+            for page_num, image in enumerate(images, start=1):
+                try:
+                    blocks = self._client.two_step_extract(image)
+                    page_md = self._blocks_to_markdown(blocks, page_num)
+                    all_page_contents.append(page_md)
+                except Exception as e:
+                    all_page_contents.append(f"\n\n<!-- Page {page_num}: Extraction failed: {e} -->\n\n")
 
         # Step 3: Combine all pages
         fulltext_markdown = "\n\n".join(all_page_contents).strip()
