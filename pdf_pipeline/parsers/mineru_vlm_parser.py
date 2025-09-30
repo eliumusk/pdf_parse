@@ -2,9 +2,12 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import base64
+import io
 from pathlib import Path
 from typing import Optional, List
 from PIL import Image
+import requests
 
 from .base import Parser, ParsedDoc
 from dotenv import load_dotenv
@@ -94,48 +97,66 @@ class MinerUVLMParser(Parser):
     This parser uses the MinerU2.5-2509-1.2B model to extract content from PDFs.
     It converts PDF pages to images and uses a vision-language model for understanding.
 
+    Supports two modes:
+    1. Local mode: Run model locally (requires GPU)
+    2. Remote mode: Call H200 HTTP API (recommended for ECS)
+
     Requirements:
-        - mineru-vl-utils[transformers] or mineru-vl-utils[vllm]
         - PyMuPDF (pymupdf) or pdf2image for PDF to image conversion
-        - GPU recommended (but can run on CPU with slower speed)
+        - requests (for remote mode)
+        - mineru-vl-utils[transformers] or mineru-vl-utils[vllm] (for local mode)
 
     Args:
         backend: VLM backend to use
-            - "transformers": Use HuggingFace transformers (default)
-            - "vllm-engine": Use vLLM engine (faster, requires vLLM)
-            - "vllm-async-engine": Use async vLLM engine
-        model_name: Model name or path (default: OpenDataLab/MinerU2.5-2509-1.2B)
-        device: Device to run model on ("auto", "cuda", "cpu")
+            - "http": Use remote HTTP API (recommended for ECS)
+            - "transformers": Use HuggingFace transformers (local)
+            - "vllm-engine": Use vLLM engine (local, faster)
+            - "vllm-async-engine": Use async vLLM engine (local)
+        model_name: Model name or path (for local mode)
+        device: Device to run model on (for local mode: "auto", "cuda", "cpu")
         dpi: Resolution for PDF to image conversion (default: 200)
+        api_url: HTTP API URL (for remote mode, e.g., "http://172.26.xxx.xxx:30100")
     """
 
     name = "mineru_vlm"
-    version = "1"
+    version = "2"  # Version 2: Added HTTP API support
 
     def __init__(
         self,
         *,
-        backend: str = "transformers",
+        backend: str = "http",  # Default to HTTP mode
         model_name: str = "OpenDataLab/MinerU2.5-2509-1.2B",
         device: str = "auto",
-        dpi: int = 200
+        dpi: int = 200,
+        api_url: str = None,  # HTTP API URL for remote mode
+        vllm_engine_path: str = None,  # Path to pre-loaded vLLM engine pickle file
+        gpu_memory_utilization: float = 0.5,  # GPU memory utilization for vLLM
+        tensor_parallel_size: int = 1,  # Number of GPUs for tensor parallelism
     ):
         self.backend = backend
         self.model_name = model_name
         self.device = device
         self.dpi = dpi
-        self._client = None  # Lazy initialization
+        self.api_url = api_url or os.getenv("MINERU_API_URL", "http://127.0.0.1:30100")
+        self.vllm_engine_path = vllm_engine_path
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.tensor_parallel_size = tensor_parallel_size
+        self._client = None  # Lazy initialization (for local mode)
 
     def _initialize_client(self):
-        """Lazy initialization of MinerU VLM client"""
+        """Lazy initialization of MinerU VLM client (for local mode only)"""
         if self._client is not None:
+            return
+
+        # HTTP mode doesn't need client initialization
+        if self.backend == "http":
             return
 
         try:
             from mineru_vl_utils import MinerUClient
         except ImportError:
             raise RuntimeError(
-                "mineru-vl-utils is required for VLM parser. "
+                "mineru-vl-utils is required for local VLM parser. "
                 "Install with: pip install 'mineru-vl-utils[transformers]' "
                 "or pip install 'mineru-vl-utils[vllm]'"
             )
@@ -186,7 +207,44 @@ class MinerUVLMParser(Parser):
         else:
             raise ValueError(
                 f"Unsupported backend: {self.backend}. "
-                f"Choose from: transformers, vllm-engine, vllm-async-engine"
+                f"Choose from: http, transformers, vllm-engine, vllm-async-engine"
+            )
+
+    def _extract_via_http(self, image: Image.Image) -> str:
+        """
+        Extract content from image via HTTP API
+
+        Args:
+            image: PIL Image object
+
+        Returns:
+            Extracted content as string
+        """
+        # Convert image to base64
+        buffered = io.BytesIO()
+        image.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+        # Call HTTP API
+        try:
+            response = requests.post(
+                f"{self.api_url}/v1/extract",
+                json={"image_base64": img_base64},
+                timeout=60  # 60 seconds timeout
+            )
+            response.raise_for_status()
+
+            result = response.json()
+            if result.get("success"):
+                return result.get("content", "")
+            else:
+                error_msg = result.get("error", "Unknown error")
+                raise RuntimeError(f"API returned error: {error_msg}")
+
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(
+                f"Failed to call MinerU API at {self.api_url}: {e}\n"
+                f"Make sure the H200 API service is running and accessible."
             )
 
     def parse(self, pdf_path: str) -> ParsedDoc:
@@ -211,20 +269,29 @@ class MinerUVLMParser(Parser):
         print(f"✅ Converted {page_count} pages to images")
 
         # Step 2: Extract content from each page using VLM
-        print(f"🤖 Extracting content using MinerU2.5 VLM...")
+        if self.backend == "http":
+            print(f"🤖 Extracting content using MinerU2.5 VLM (via HTTP API: {self.api_url})...")
+        else:
+            print(f"🤖 Extracting content using MinerU2.5 VLM (local mode)...")
+
         all_page_contents = []
 
         for page_num, image in enumerate(images, start=1):
             print(f"   Processing page {page_num}/{page_count}...", end=" ")
 
             try:
-                # Use two_step_extract for better results
-                extracted_blocks = self._client.two_step_extract(image)
+                # Use HTTP API or local client
+                if self.backend == "http":
+                    # Remote mode: call HTTP API
+                    content = self._extract_via_http(image)
+                    page_md = f"\n\n<!-- Page {page_num} -->\n\n{content}"
+                else:
+                    # Local mode: use two_step_extract
+                    extracted_blocks = self._client.two_step_extract(image)
+                    # Convert extracted blocks to markdown
+                    page_md = self._blocks_to_markdown(extracted_blocks, page_num)
 
-                # Convert extracted blocks to markdown
-                page_md = self._blocks_to_markdown(extracted_blocks, page_num)
                 all_page_contents.append(page_md)
-
                 print("✅")
 
             except Exception as e:

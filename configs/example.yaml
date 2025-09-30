@@ -1,6 +1,6 @@
-parser: pymupdf # options: pymupdf | markitdown | mineru | mineru_vlm
+parser: mineru # options: pymupdf | markitdown | mineru | mineru_vlm
 input_dir: "test/"
-output_path: "docs/pymupdf/"  # Directory for individual files
+output_path: "docs/mineru/"  # Directory for individual files
 num_workers: 8
 allow_network: false
 one_file_per_doc: true  # Save each document separately

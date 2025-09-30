@@ -1,0 +1,26 @@
+# MinerU VLM HTTP Mode Configuration
+# Uses MinerU2.5 Vision-Language Model via HTTP API on H200
+# PDF files stay on ECS, only images are sent to H200 for inference
+
+parser: mineru_vlm
+input_dir: "test/"
+output_path: "docs/mineru_vlm_http/"  # Directory for individual parquet files
+num_workers: 4  # Can use multiple workers since model is on H200
+allow_network: true  # Need network to call H200 API
+one_file_per_doc: true  # Save each document separately
+
+# Parser-specific configuration
+parser_config:
+  backend: "http"
+  api_url: "http://172.26.104.1:30100"
+  dpi: 200
+
+cleaning:
+  unicode_nfkc: false  # VLM output is already clean
+  fix_hyphenation: false
+  remove_headers_footers: false
+
+dedup:
+  enabled: true  # Create dedup index (all files are kept)
+  fuzzy_threshold: 90
+
