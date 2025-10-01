@@ -1,12 +1,19 @@
-# MinerU VLM Mode Configuration
+# MinerU VLM Mode Configuration (Optimized for H200 GPU Cluster)
 # Uses MinerU2.5 Vision-Language Model (1.2B parameters)
 # GPU HIGHLY RECOMMENDED
 # Requirements: pip install 'mineru-vl-utils[transformers]' modelscope pymupdf
 
 parser: mineru_vlm
-input_dir: "test/"
+input_dir: "/data/public_data/arxiv_database/arxiv/pdf/2508"
 output_path: "docs/mineru_vlm/"  # Directory for individual parquet files
-num_workers: 4  # VLM mode: use 1 worker to avoid GPU memory issues
+
+# ============================================================================
+# OPTIMIZED: Increased workers to fully utilize 3 GPU instances
+# Each worker processes 1 PDF at a time, distributing load across 3 GPUs
+# Recommended: 12-24 workers for 3 GPUs (4-8x GPU count)
+# ============================================================================
+num_workers: 16  # Increased from 4 to 16 for better GPU utilization
+
 allow_network: true  # May need to download model on first run
 one_file_per_doc: true  # Save each document separately
 
@@ -19,6 +26,14 @@ parser_config:
     - "http://172.26.104.1:30101"
     - "http://172.26.104.1:30102"
   dpi: 200
+
+  # ============================================================================
+  # OPTIMIZED: Batch processing and timeout settings
+  # ============================================================================
+  batch_size: 32  # Process up to 32 pages per HTTP request (reduce overhead)
+  request_timeout: 600  # 10 minutes for large batches
+  retry_attempts: 3  # Retry failed requests
+  retry_delay: 2  # Seconds between retries
 
 
 cleaning:

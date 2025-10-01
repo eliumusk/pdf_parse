@@ -1,0 +1,29 @@
+pdf_parse/docs/
+/logs
+.env
+*.vscode
+.DS_Store
+*.empty
+*.parquet
+/__pycache__/
+*/models
+/pdf_parse/models
+pdf_parse/models/
+# VSCode
+.vscode/
+pdf_parse/.vscode/
+pdf_parse/.empty
+
+# Docs & logs
+docs/
+pdf_parse/logs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Data
+*.parquet
+id_rsa_h200_zxy
+.env
+doc.md

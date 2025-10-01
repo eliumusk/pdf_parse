@@ -1,0 +1,142 @@
+# MinerU VLM Production Configuration (Optimized for 3M PDFs on H200 Cluster)
+# ============================================================================
+# This configuration is optimized for maximum throughput on 3 H200 GPUs
+# Expected performance: 2-3x improvement over baseline configuration
+# ============================================================================
+
+parser: mineru_vlm
+input_dir: "/data/public_data/arxiv_database/arxiv/pdf/2508"
+# input_dir: "test/"
+output_path: "docs/mineru_vlm/"
+allow_network: true
+one_file_per_doc: true
+
+# ============================================================================
+# WORKER CONFIGURATION
+# ============================================================================
+# Recommended formula: num_workers = GPU_count × (4-8)
+# - 3 GPUs × 6 = 18 workers provides good balance
+# - Each worker processes 1 PDF at a time
+# - Round-robin load balancing distributes work across GPUs
+# - Adjust based on your CPU cores and network bandwidth
+# ============================================================================
+num_workers: 18
+
+# ============================================================================
+# PARSER CONFIGURATION
+# ============================================================================
+parser_config:
+  backend: "http"
+  
+  # GPU endpoints (all 3 H200 GPUs with optimized memory settings)
+  api_urls:
+    - "http://172.26.104.1:30100"  # GPU 5
+    - "http://172.26.104.1:30101"  # GPU 6
+    - "http://172.26.104.1:30102"  # GPU 7
+  
+  # Image quality (higher DPI = better quality but slower)
+  dpi: 200
+  
+  # ============================================================================
+  # BATCH PROCESSING SETTINGS
+  # ============================================================================
+  # batch_size: Number of pages to send in one HTTP request
+  # - Larger batches reduce HTTP overhead
+  # - Too large may cause timeouts or memory issues
+  # - Recommended: 16-32 for typical PDFs (10-50 pages)
+  # - Adjust to 64+ for very short documents
+  # ============================================================================
+  batch_size: 128
+  
+  # ============================================================================
+  # TIMEOUT AND RETRY SETTINGS
+  # ============================================================================
+  # request_timeout: Maximum time to wait for a single HTTP request
+  # - Formula: batch_size × 15-20 seconds per page
+  # - 32 pages × 15s = 480s (8 minutes) + buffer = 600s
+  # ============================================================================
+  request_timeout: 600  # 1 minutes
+  
+  # retry_attempts: Number of times to retry failed requests
+  # - Helps handle transient network issues or GPU OOM
+  # - Each retry uses a different GPU (round-robin)
+  # ============================================================================
+  retry_attempts: 3
+  
+  # retry_delay: Seconds to wait between retries
+  # - Gives GPU time to recover from temporary issues
+  # ============================================================================
+  retry_delay: 2.0
+
+# ============================================================================
+# CLEANING CONFIGURATION
+# ============================================================================
+# VLM output is already high-quality, minimal cleaning needed
+# ============================================================================
+cleaning:
+  unicode_nfkc: false
+  fix_hyphenation: false
+  remove_headers_footers: false
+
+# ============================================================================
+# DEDUPLICATION CONFIGURATION
+# ============================================================================
+dedup:
+  enabled: true
+  fuzzy_threshold: 90
+
+# ============================================================================
+# PERFORMANCE EXPECTATIONS
+# ============================================================================
+# Baseline (4 workers, batch_size=all, gpu_memory=0.35):
+#   - ~1-2 PDFs/minute per GPU
+#   - ~3-6 PDFs/minute total (3 GPUs)
+#   - 3M PDFs = ~8,000-17,000 hours = 333-708 days
+#
+# Optimized (18 workers, batch_size=32, gpu_memory=0.85):
+#   - ~4-6 PDFs/minute per GPU (2-3x improvement)
+#   - ~12-18 PDFs/minute total (3 GPUs)
+#   - 3M PDFs = ~2,800-4,200 hours = 117-175 days
+#
+# Further optimization with more GPUs:
+#   - 8 H200 GPUs: ~32-48 PDFs/minute = ~44-65 days for 3M PDFs
+# ============================================================================
+
+# ============================================================================
+# MONITORING TIPS
+# ============================================================================
+# 1. Monitor GPU utilization:
+#    watch -n 1 nvidia-smi
+#
+# 2. Monitor processing speed:
+#    tail -f logs/run_metrics.parquet
+#
+# 3. Check for errors:
+#    tail -f logs/errors.parquet
+#
+# 4. Monitor network bandwidth:
+#    iftop -i eth0
+#
+# 5. Check vLLM logs for preemption warnings:
+#    grep -i "preempt" gpu*.log
+# ============================================================================
+
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+# Issue: "Connection timeout" errors
+# Solution: Increase request_timeout or reduce batch_size
+#
+# Issue: "GPU out of memory" on server
+# Solution: Reduce gpu_memory_utilization on H200 (currently 0.85)
+#
+# Issue: Low GPU utilization (<50%)
+# Solution: Increase num_workers (try 24-32)
+#
+# Issue: High CPU usage on client
+# Solution: Reduce num_workers or increase batch_size
+#
+# Issue: Uneven load across GPUs
+# Solution: Check that all 3 endpoints are healthy (health check runs automatically)
+# ============================================================================
+

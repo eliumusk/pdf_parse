@@ -1,6 +1,8 @@
-# MinerU VLM HTTP Mode Configuration
+# MinerU VLM HTTP Mode Configuration (Basic)
 # Uses MinerU2.5 Vision-Language Model via HTTP API on H200
 # PDF files stay on ECS, only images are sent to H200 for inference
+#
+# NOTE: For production use with 3M PDFs, use configs/mineru_vlm_production.yaml instead
 
 parser: mineru_vlm
 input_dir: "test/"
@@ -14,6 +16,10 @@ parser_config:
   backend: "http"
   api_url: "http://172.26.104.1:30100"
   dpi: 200
+  # Optional: Add these for better performance
+  # batch_size: 32
+  # request_timeout: 600
+  # retry_attempts: 3
 
 cleaning:
   unicode_nfkc: false  # VLM output is already clean

@@ -288,6 +288,22 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
     success_count = 0
     fail_count = 0
 
+    # Write initial metrics (so monitor can show total count immediately)
+    try:
+        pd.DataFrame.from_records([
+            {
+                "total": len(all_pdfs),
+                "queued": len(pdfs),
+                "success": 0,
+                "failed": 0,
+                "parser": cfg.parser,
+                "num_workers": num_workers,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ]).to_parquet("logs/run_metrics.parquet", engine="pyarrow", compression="zstd")
+    except Exception:
+        pass
+
     # Process in parallel; stream writes per-document
     with ProcessPoolExecutor(max_workers=num_workers) as ex:
         futs = [ex.submit(_process_one, p, cfg.parser, cleaning_cfg, cfg.parser_config) for p in pdfs]
@@ -328,11 +344,29 @@ def run_pipeline(cfg: PipelineConfig) -> Dict[str, Any]:
                     }
                     append_row_to_parquet(index_path, index_row)
                 success_count += 1
+
+                # Update metrics every 10 successful documents (for real-time monitoring)
+                if success_count % 10 == 0:
+                    try:
+                        pd.DataFrame.from_records([
+                            {
+                                "total": len(all_pdfs),
+                                "queued": len(pdfs),
+                                "success": success_count,
+                                "failed": fail_count,
+                                "parser": cfg.parser,
+                                "num_workers": num_workers,
+                                "created_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        ]).to_parquet("logs/run_metrics.parquet", engine="pyarrow", compression="zstd")
+                    except Exception:
+                        pass
+
             if err:
                 append_error_row(Path("logs/errors.parquet"), err)
                 fail_count += 1
 
-    # Metrics
+    # Final metrics update
     try:
         pd.DataFrame.from_records([
             {

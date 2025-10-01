@@ -133,6 +133,10 @@ class MinerUVLMParser(Parser):
         vllm_engine_path: str = None,  # Path to pre-loaded vLLM engine pickle file
         gpu_memory_utilization: float = 0.5,  # GPU memory utilization for vLLM
         tensor_parallel_size: int = 1,  # Number of GPUs for tensor parallelism
+        batch_size: int = 32,  # Number of pages to process in one HTTP request
+        request_timeout: int = 600,  # HTTP request timeout in seconds
+        retry_attempts: int = 3,  # Number of retry attempts for failed requests
+        retry_delay: float = 2.0,  # Delay between retries in seconds
     ):
         self.backend = backend
         self.model_name = model_name
@@ -143,10 +147,19 @@ class MinerUVLMParser(Parser):
             self.api_urls = api_urls
         else:
             self.api_urls = [api_url or os.getenv("MINERU_API_URL", "http://127.0.0.1:30100")]
+
+        # Round-robin index with worker-based offset for better load balancing
+        # Each worker process will start from a different endpoint
         self._rr_idx = 0
+        self._worker_offset = os.getpid() % len(self.api_urls)
+
         self.vllm_engine_path = vllm_engine_path
         self.gpu_memory_utilization = gpu_memory_utilization
         self.tensor_parallel_size = tensor_parallel_size
+        self.batch_size = batch_size
+        self.request_timeout = request_timeout
+        self.retry_attempts = retry_attempts
+        self.retry_delay = retry_delay
         self._client = None  # Lazy initialization (for local mode)
 
     def _initialize_client(self):
@@ -218,7 +231,7 @@ class MinerUVLMParser(Parser):
 
     def _extract_via_http(self, image: Image.Image) -> List[dict]:
         """
-        Extract structured blocks from image via HTTP API
+        Extract structured blocks from image via HTTP API (with retry logic)
 
         Args:
             image: PIL Image object
@@ -226,46 +239,73 @@ class MinerUVLMParser(Parser):
         Returns:
             List[dict]: structured blocks as returned by server; fallback to a single text block
         """
+        import time
+
         # Convert image to base64 (PNG to preserve quality)
         buffered = io.BytesIO()
         image.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-        # Call HTTP API
-        try:
-            # Round-robin select API endpoint
-            api_url = self.api_urls[self._rr_idx % len(self.api_urls)]
-            self._rr_idx += 1
+        # Retry logic
+        last_exception = None
+        for attempt in range(self.retry_attempts):
+            try:
+                # Round-robin select API endpoint with worker-based offset
+                # This ensures different workers start from different endpoints
+                idx = (self._rr_idx + self._worker_offset) % len(self.api_urls)
+                api_url = self.api_urls[idx]
+                self._rr_idx += 1
 
-            response = requests.post(
-                f"{api_url}/v1/extract",
-                json={"image_base64": img_base64},
-                timeout=120  # allow more time for large pages
-            )
-            response.raise_for_status()
+                response = requests.post(
+                    f"{api_url}/v1/extract",
+                    json={"image_base64": img_base64},
+                    timeout=self.request_timeout
+                )
+                response.raise_for_status()
 
-            result = response.json()
-            if result.get("success"):
-                blocks = result.get("blocks")
-                if isinstance(blocks, list):
-                    return blocks
-                # Fallback: wrap plain content as a text block
-                content = result.get("content", "")
-                return [{"type": "text", "content": content}]
-            else:
-                error_msg = result.get("error", "Unknown error")
-                raise RuntimeError(f"API returned error: {error_msg}")
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(
-                f"Failed to call MinerU API at {api_url}: {e}\n"
-                f"Make sure the H200 API service is running and accessible."
-            )
+                result = response.json()
+                if result.get("success"):
+                    blocks = result.get("blocks")
+                    if isinstance(blocks, list):
+                        return blocks
+                    # Fallback: wrap plain content as a text block
+                    content = result.get("content", "")
+                    return [{"type": "text", "content": content}]
+                else:
+                    error_msg = result.get("error", "Unknown error")
+                    raise RuntimeError(f"API returned error: {error_msg}")
+
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                if attempt < self.retry_attempts - 1:
+                    print(f"⚠️  Request failed (attempt {attempt + 1}/{self.retry_attempts}), retrying in {self.retry_delay}s...")
+                    time.sleep(self.retry_delay)
+                    continue
+
+        # All retries failed
+        raise RuntimeError(
+            f"Failed to call MinerU API after {self.retry_attempts} attempts: {last_exception}\n"
+            f"Make sure the H200 API service is running and accessible."
+        )
 
     def _extract_batch_via_http(self, images: List[Image.Image]) -> List[List[dict]]:
         """
         Batch extract structured blocks for multiple images via HTTP API.
+        Automatically splits large batches into smaller chunks.
         Returns a list of blocks per page in order.
         """
+        import time
+
+        # If batch is too large, split into smaller chunks
+        if len(images) > self.batch_size:
+            print(f"📦 Splitting {len(images)} pages into batches of {self.batch_size}...")
+            all_results = []
+            for i in range(0, len(images), self.batch_size):
+                batch = images[i:i + self.batch_size]
+                batch_results = self._extract_batch_via_http(batch)
+                all_results.extend(batch_results)
+            return all_results
+
         # Encode images to base64 PNGs
         payload_images: List[str] = []
         for img in images:
@@ -273,34 +313,64 @@ class MinerUVLMParser(Parser):
             img.save(buf, format="PNG")
             payload_images.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
 
-        try:
-            api_url = self.api_urls[self._rr_idx % len(self.api_urls)]
-            self._rr_idx += 1
+        # Retry logic
+        last_exception = None
+        for attempt in range(self.retry_attempts):
+            try:
+                # Round-robin select API endpoint with worker-based offset
+                idx = (self._rr_idx + self._worker_offset) % len(self.api_urls)
+                api_url = self.api_urls[idx]
+                self._rr_idx += 1
 
-            resp = requests.post(
-                f"{api_url}/v1/extract_batch",
-                json={"images": payload_images},
-                timeout=300,  # allow longer for batches
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])
-            blocks_per_page: List[List[dict]] = []
-            for item in results:
-                if item.get("success"):
-                    blocks = item.get("blocks")
-                    if isinstance(blocks, list):
-                        blocks_per_page.append(blocks)
+                # FIX: Server expects array directly, not {"images": [...]}
+                resp = requests.post(
+                    f"{api_url}/v1/extract_batch",
+                    json=payload_images,  # Send array directly
+                    timeout=self.request_timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                results = data.get("results", [])
+                blocks_per_page: List[List[dict]] = []
+                for item in results:
+                    if item.get("success"):
+                        blocks = item.get("blocks")
+                        if isinstance(blocks, list):
+                            blocks_per_page.append(blocks)
+                        else:
+                            content = item.get("content", "")
+                            blocks_per_page.append([{ "type": "text", "content": content }])
                     else:
-                        content = item.get("content", "")
-                        blocks_per_page.append([{ "type": "text", "content": content }])
-                else:
-                    blocks_per_page.append([{ "type": "text", "content": "" }])
-            return blocks_per_page
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(
-                f"Failed to call MinerU batch API: {e}"
-            )
+                        blocks_per_page.append([{ "type": "text", "content": "" }])
+                return blocks_per_page
+
+            except requests.exceptions.Timeout as e:
+                last_exception = e
+                if attempt < self.retry_attempts - 1:
+                    print(f"⚠️  Batch request TIMEOUT (attempt {attempt + 1}/{self.retry_attempts})")
+                    print(f"   Batch size: {len(payload_images)} pages, Timeout: {self.request_timeout}s")
+                    print(f"   Tip: Increase request_timeout or reduce batch_size")
+                    print(f"   Retrying in {self.retry_delay}s...")
+                    time.sleep(self.retry_delay)
+                    continue
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                if attempt < self.retry_attempts - 1:
+                    print(f"⚠️  Batch request failed (attempt {attempt + 1}/{self.retry_attempts}): {type(e).__name__}")
+                    print(f"   Error: {str(e)[:200]}")
+                    print(f"   Retrying in {self.retry_delay}s...")
+                    time.sleep(self.retry_delay)
+                    continue
+
+        # All retries failed
+        error_type = type(last_exception).__name__
+        raise RuntimeError(
+            f"Failed to call MinerU batch API after {self.retry_attempts} attempts.\n"
+            f"Error type: {error_type}\n"
+            f"Last error: {last_exception}\n"
+            f"Batch size: {len(payload_images)} pages, Timeout: {self.request_timeout}s\n"
+            f"Tip: If timeout errors, increase request_timeout in config (recommended: 600s for batch_size=32)"
+        )
 
     def parse(self, pdf_path: str) -> ParsedDoc:
         """
@@ -324,8 +394,13 @@ class MinerUVLMParser(Parser):
         print(f"✅ Converted {page_count} pages to images")
 
         # Step 2: Extract content from each page using VLM
+        import time
+        extract_start = time.time()
+
         if self.backend == "http":
-            print("🤖 Extracting content using MinerU2.5 VLM (via HTTP API, round-robin across endpoints)...")
+            print(f"🤖 Extracting content using MinerU2.5 VLM (via HTTP API, batch_size={self.batch_size})...")
+            print(f"   📡 Load balancing across {len(self.api_urls)} endpoints")
+            print(f"   🔀 Worker PID={os.getpid()}, starting from endpoint index {self._worker_offset}")
         else:
             print("🤖 Extracting content using MinerU2.5 VLM (local mode)...")
 
@@ -338,7 +413,14 @@ class MinerUVLMParser(Parser):
                 for page_num, blocks in enumerate(blocks_pages, start=1):
                     page_md = self._blocks_to_markdown(blocks, page_num)
                     all_page_contents.append(page_md)
+
+                extract_time = time.time() - extract_start
+                pages_per_sec = page_count / extract_time if extract_time > 0 else 0
+                print(f"   ⚡ Extraction speed: {pages_per_sec:.2f} pages/sec ({extract_time:.1f}s total)")
+
             except Exception as e:
+                print(f"⚠️  Batch processing failed: {e}")
+                print("   Falling back to per-page requests...")
                 # Fallback to per-page requests
                 for page_num, image in enumerate(images, start=1):
                     try:
@@ -346,6 +428,7 @@ class MinerUVLMParser(Parser):
                         page_md = self._blocks_to_markdown(blocks, page_num)
                         all_page_contents.append(page_md)
                     except Exception as ee:
+                        print(f"   ❌ Page {page_num} failed: {ee}")
                         all_page_contents.append(f"\n\n<!-- Page {page_num}: Extraction failed: {ee} -->\n\n")
         else:
             for page_num, image in enumerate(images, start=1):
